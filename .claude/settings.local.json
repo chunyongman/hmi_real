@@ -9,7 +9,20 @@
       "Bash(robocopy:*)",
       "Bash(taskkill:*)",
       "Bash(nul)",
-      "Bash(npm run dev:*)"
+      "Bash(npm run dev:*)",
+      "Bash(dir:*)",
+      "Bash(mkdir:*)",
+      "Bash(move \"FAN_DIAGRAM_설정_가이드.md\" docs )",
+      "Bash(move:*)",
+      "Bash(move \"배포_용량_최적화_가이드.md\" docs )",
+      "Bash(move \"빠른_실행_가이드.md\" docs )",
+      "Bash(move \"사용_가이드.md\" docs )",
+      "Bash(move \"사용_방법.md\" docs )",
+      "Bash(move \"사용자_가이드.md\" docs )",
+      "Bash(move \"시뮬레이터_사용_가이드.md\" docs )",
+      "Bash(move \"전체_구현_완료.md\" docs )",
+      "Bash(mv:*)",
+      "Bash(rm:*)"
     ],
     "deny": [],
     "ask": []
