@@ -29,6 +29,8 @@ class PLCClient:
         if use_simulation:
             logger.info("🎮 시뮬레이션 모드 활성화")
             self.sim_start_time = time.time()
+            self.sim_alarm_counter = 0  # 알람 시나리오 카운터
+            self.sim_alarm_active = False  # 알람 활성 상태
             self.sim_equipment_states = {
                 # 해수 펌프 (SWP1, SWP2 운전 / SWP3 스탠바이)
                 "SWP1": {"running": True, "ess_mode": True, "auto_mode": True, "vfd_mode": True, "frequency": 45.0, "run_hours": 1234},
@@ -486,19 +488,124 @@ class PLCClient:
         """시뮬레이션 센서 데이터 - 실제처럼 변하는 값"""
         elapsed = time.time() - self.sim_start_time
 
+        # 프로그램 시작 후 60초 동안은 알람 발생 안 함 (안정화 시간)
+        if elapsed < 60:
+            alarm_active = False
+            cycle_position = int(elapsed)
+            selected_alarms = []
+        else:
+            # 60초 이후부터 알람 시나리오 시작
+            # 알람 시나리오: 3분(180초) 주기로 순환
+            adjusted_elapsed = elapsed - 60  # 60초를 빼서 60초부터 시작
+            cycle_position = int(adjusted_elapsed) % 180
+            cycle_number = int(adjusted_elapsed) // 180  # 몇 번째 주기인지 (0, 1, 2, ...)
+
+            # 알람 발생 시간: 매 주기의 0~15초 (60초 후부터 시작하므로 실제로는 60~75초)
+            # 15~180초는 정상 상태
+            alarm_active = (0 <= cycle_position < 15)
+
+            # 새 알람 주기 시작 시 랜덤하게 2개 선택 (주기마다 동일한 알람 유지)
+            if not hasattr(self, 'current_alarm_set') or cycle_position == 0:
+                # 7개 센서 중 랜덤하게 2개 선택
+                all_sensors = ['TX1', 'TX4', 'TX6', 'TX7', 'DPX1', 'DPX2', 'PU1']
+                random.seed(cycle_number)  # 같은 주기에서는 동일한 알람 유지
+                selected_alarms = random.sample(all_sensors, 2)
+                self.current_alarm_set = selected_alarms
+            else:
+                selected_alarms = self.current_alarm_set
+
+        # 알람 상태 전환 시 로그 출력
+        if cycle_position == 0 and not self.sim_alarm_active and elapsed >= 60:
+            self.sim_alarm_active = True
+            self._new_cycle_started = True  # 새 사이클 시작 플래그
+            logger.warning("=" * 70)
+            logger.warning("🔔 [시뮬레이터] 랜덤 알람 발생 (15초간 유지)")
+
+            # 선택된 알람 정보 출력
+            alarm_names = {
+                'TX1': '냉각수 토출 온도 상승',
+                'TX4': '청수 입구 온도 상승',
+                'TX6': 'E/R 내부 고온',
+                'TX7': 'E/R 외부 고온',
+                'DPX1': '냉각수 압력 저하',
+                'DPX2': '기관실 차압 이상',
+                'PU1': '주기관 부하 과다'
+            }
+            for sensor in selected_alarms:
+                logger.warning(f"  - {alarm_names[sensor]} ({sensor})")
+            logger.warning("=" * 70)
+        elif cycle_position == 15 and self.sim_alarm_active:
+            self.sim_alarm_active = False
+            logger.info("✅ [시뮬레이터] 알람 시나리오 종료 (정상 복귀)")
+            logger.info(f"   다음 알람은 {180 - 15}초 후 발생 (랜덤 알람 2개)")
+
+        # 랜덤 알람 시스템: 선택된 센서만 알람 값으로 설정
+        if alarm_active:
+            # 기본값: 모든 센서 정상
+            tx1_value = 25.0 + random.uniform(-2, 2)
+            tx4_value = 45.0 + random.uniform(-2, 3)
+            tx6_value = 35.0 + random.uniform(-3, 3)
+            tx7_value = 28.0 + random.uniform(-2, 2)
+            dpx1_value = 2.5 + random.uniform(-0.1, 0.1)
+            dpx2_value = 100.0 + random.uniform(-10, 10)
+            pu1_value = 60.0 + random.uniform(-10, 10)
+
+            # 선택된 센서들을 알람 값으로 설정 (안정적인 범위로 고정)
+            alarm_values = {
+                'TX1': lambda: 32.0 + random.uniform(-0.5, 0.5),    # 냉각수 토출 고온 (임계값 30°C)
+                'TX4': lambda: 52.0 + random.uniform(-0.5, 0.5),    # 청수 입구 고온 (임계값 50°C)
+                'TX6': lambda: 52.0 + random.uniform(-0.3, 0.3),    # E/R 내부 고온 (임계값 50°C)
+                'TX7': lambda: 42.0 + random.uniform(-0.3, 0.3),    # E/R 외부 고온 (임계값 40°C)
+                'DPX1': lambda: 1.3 + random.uniform(-0.02, 0.02),  # 냉각수 압력 저하 (임계값 1.5 bar)
+                'DPX2': lambda: 160.0 + random.uniform(-2, 2),      # E/R 차압 이상 (임계값 150 Pa)
+                'PU1': lambda: 90.0 + random.uniform(-1, 1)         # 기관 부하 과다 (임계값 85%)
+            }
+
+            for sensor in selected_alarms:
+                if sensor == 'TX1':
+                    tx1_value = alarm_values[sensor]()
+                elif sensor == 'TX4':
+                    tx4_value = alarm_values[sensor]()
+                elif sensor == 'TX6':
+                    tx6_value = alarm_values[sensor]()
+                elif sensor == 'TX7':
+                    tx7_value = alarm_values[sensor]()
+                elif sensor == 'DPX1':
+                    dpx1_value = alarm_values[sensor]()
+                elif sensor == 'DPX2':
+                    dpx2_value = alarm_values[sensor]()
+                elif sensor == 'PU1':
+                    pu1_value = alarm_values[sensor]()
+        else:
+            # 정상 상태 (0~149초)
+            tx6_value = 35.0 + random.uniform(-3, 3)      # 정상 범위
+            tx7_value = 28.0 + random.uniform(-2, 2)      # 정상 범위
+            tx1_value = 25.0 + random.uniform(-2, 2)      # 정상 범위
+            tx4_value = 45.0 + random.uniform(-2, 3)      # 정상 범위
+            dpx1_value = 2.5 + random.uniform(-0.1, 0.1)  # 정상 범위
+            dpx2_value = 100.0 + random.uniform(-10, 10)  # 정상 범위
+            pu1_value = 60.0 + random.uniform(-10, 10)    # 정상 범위
+
         # 사인파로 변동하는 온도/압력 시뮬레이션
-        return {
-            "TX1": round(25.0 + random.uniform(-2, 2) + 3 * (elapsed % 10) / 10, 1),  # CSW PP Disc Temp (25~30°C)
+        data = {
+            "TX1": round(tx1_value, 1),                                               # CSW PP Disc Temp
             "TX2": round(22.0 + random.uniform(-1, 1) + 2 * (elapsed % 10) / 10, 1),  # CSW PP Suc Temp (22~25°C)
             "TX3": round(20.0 + random.uniform(-1, 1), 1),                            # FW Cooler 2 SW Out (19~21°C)
-            "TX4": round(45.0 + random.uniform(-2, 3), 1),                            # FW Cooler FW In (43~48°C)
+            "TX4": round(tx4_value, 1),                                               # FW Cooler FW In
             "TX5": round(35.0 + random.uniform(-1, 1), 1),                            # FW Cooler FW Out (34~36°C)
-            "TX6": round(35.0 + random.uniform(-3, 3), 1),                            # E/R Inside Temp (32~38°C)
-            "TX7": round(28.0 + random.uniform(-2, 2), 1),                            # E/R Outside Temp (26~30°C)
-            "DPX1": round(2.5 + random.uniform(-0.1, 0.1), 2),                        # CSW PP Disc Press (2.4~2.6 kg/cm²)
-            "DPX2": round(100.0 + random.uniform(-10, 10), 1),                        # E/R Diff Press (90~110 Pa)
-            "PU1": round(60.0 + random.uniform(-10, 10), 1),                          # M/E Load (50~70%)
+            "TX6": round(tx6_value, 1),                                               # E/R Inside Temp
+            "TX7": round(tx7_value, 1),                                               # E/R Outside Temp
+            "DPX1": round(dpx1_value, 2),                                             # CSW PP Disc Press
+            "DPX2": round(dpx2_value, 1),                                             # E/R Diff Press
+            "PU1": round(pu1_value, 1),                                               # M/E Load
+            "_new_cycle": getattr(self, '_new_cycle_started', False)                 # 새 사이클 플래그
         }
+
+        # 플래그 리셋
+        if hasattr(self, '_new_cycle_started'):
+            self._new_cycle_started = False
+
+        return data
 
     def _get_simulated_equipment_status(self) -> Dict[str, Any]:
         """시뮬레이션 장비 상태"""

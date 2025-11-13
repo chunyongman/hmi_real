@@ -48,6 +48,10 @@ class ESSPLCSimulator:
         # 시뮬레이션 상태
         self.running = True
 
+        # 알람 시나리오 카운터 (60초마다 알람 조건 생성)
+        self.alarm_scenario_counter = 0
+        self.alarm_active = False
+
         # 장비 상태 (3 SWP, 3 FWP, 4 Fans)
         self.equipment = {
             # Sea Water Pumps
@@ -116,13 +120,36 @@ class ESSPLCSimulator:
 
         while self.running:
             try:
+                # 알람 시나리오: 60초마다 알람 조건 생성, 10초간 유지
+                self.alarm_scenario_counter += 1
+
+                if self.alarm_scenario_counter >= 60 and not self.alarm_active:
+                    # 알람 조건 시작
+                    self.alarm_active = True
+                    self.alarm_scenario_counter = 0
+                    print("[시뮬레이터] 🔔 알람 시나리오 시작 (10초간 유지)")
+                    print("  - E/R 온도 상승 (TX6: 40°C → 52°C)")
+                    print("  - SW 압력 저하 (DPX1: 3.5 → 1.3 kg/cm²)")
+
+                if self.alarm_active and self.alarm_scenario_counter >= 10:
+                    # 알람 조건 해제
+                    self.alarm_active = False
+                    self.alarm_scenario_counter = 0
+                    print("[시뮬레이터] ✅ 알람 시나리오 종료 (정상 복귀)")
+
                 # 온도 센서 (K400010~K400016)
                 tx1 = self.base_temps['TX1'] + random.uniform(-1.5, 1.5)
                 tx2 = self.base_temps['TX2'] + random.uniform(-1.0, 1.0)
                 tx3 = self.base_temps['TX3'] + random.uniform(-2.0, 2.0)
                 tx4 = self.base_temps['TX4'] + random.uniform(-1.5, 1.5)
                 tx5 = self.base_temps['TX5'] + random.uniform(-1.0, 1.0)
-                tx6 = self.base_temps['TX6'] + random.uniform(-2.0, 2.0)
+
+                # TX6 (E/R 온도) - 알람 시나리오 적용
+                if self.alarm_active:
+                    tx6 = 52.0 + random.uniform(-0.5, 0.5)  # 알람 조건 (HIGH: 50°C 이상)
+                else:
+                    tx6 = self.base_temps['TX6'] + random.uniform(-2.0, 2.0)
+
                 tx7 = self.base_temps['TX7'] + random.uniform(-0.5, 0.5)
 
                 # Holding Registers에 쓰기 (address 10~16)
@@ -137,7 +164,12 @@ class ESSPLCSimulator:
                 ])
 
                 # 압력 센서 (K400017~K400018)
-                dpx1 = self.base_pressure['DPX1'] + random.uniform(-0.1, 0.1)
+                # DPX1 (SW 압력) - 알람 시나리오 적용
+                if self.alarm_active:
+                    dpx1 = 1.3 + random.uniform(-0.05, 0.05)  # 알람 조건 (LOW: 1.5 bar 이하)
+                else:
+                    dpx1 = self.base_pressure['DPX1'] + random.uniform(-0.1, 0.1)
+
                 dpx2 = self.base_pressure['DPX2'] + random.uniform(-2.0, 2.0)
 
                 self.store.setValues(3, 17, [

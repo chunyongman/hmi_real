@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from modbus_client import PLCClient
+from alarm_manager import AlarmManager, AlarmLevel, EventType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,6 +38,9 @@ app.add_middleware(
 # use_simulation=True로 설정하면 실제 PLC 없이 시뮬레이션 데이터 사용
 plc_client = PLCClient(host="192.168.0.130", port=502, slave_id=3, use_simulation=True)
 
+# 알람 관리자 인스턴스
+alarm_manager = AlarmManager(data_dir="data")
+
 # WebSocket 연결 관리
 active_connections: List[WebSocket] = []
 
@@ -50,6 +54,11 @@ class EquipmentCommand(BaseModel):
 class SettingUpdate(BaseModel):
     address: int
     value: int
+
+
+class AlarmAck(BaseModel):
+    alarm_id: str
+    user: str = "Operator"
 
 
 @app.on_event("startup")
@@ -175,6 +184,13 @@ async def send_equipment_command(command: EquipmentCommand):
     if not success:
         raise HTTPException(status_code=500, detail="Failed to send command to PLC")
 
+    # 제어 명령 이벤트 로그
+    alarm_manager.add_event(
+        EventType.CONTROL,
+        "Operator",
+        f"{command.equipment_name} {command.command.upper()} command executed"
+    )
+
     return {
         "success": True,
         "message": f"{command.equipment_name} {command.command} command sent",
@@ -217,9 +233,90 @@ async def update_setting(setting: SettingUpdate):
     if not success:
         raise HTTPException(status_code=500, detail="Failed to write to PLC")
 
+    # 설정 변경 이벤트 로그
+    alarm_manager.add_event(
+        EventType.SETTING,
+        "Operator",
+        f"Register {setting.address} updated to {setting.value}",
+        {"address": setting.address, "value": setting.value}
+    )
+
     return {
         "success": True,
         "message": f"Register {setting.address} updated to {setting.value}",
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+# ===== 알람 및 이력 API =====
+
+@app.get("/api/alarms/active")
+async def get_active_alarms():
+    """활성 알람 목록 조회"""
+    alarms = alarm_manager.get_active_alarms()
+    summary = alarm_manager.get_alarm_summary()
+    return {
+        "success": True,
+        "data": alarms,
+        "summary": summary,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/alarms/history")
+async def get_alarm_history(limit: int = 100, level: str = None):
+    """알람 이력 조회"""
+    alarms = alarm_manager.get_alarm_history(limit=limit, level=level)
+    return {
+        "success": True,
+        "data": alarms,
+        "count": len(alarms),
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.post("/api/alarms/acknowledge")
+async def acknowledge_alarm(ack: AlarmAck):
+    """알람 확인"""
+    success = alarm_manager.acknowledge_alarm(ack.alarm_id, ack.user)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Alarm not found")
+
+    # 알람 확인 이벤트 로그
+    alarm_manager.add_event(
+        EventType.ALARM,
+        ack.user,
+        f"Alarm {ack.alarm_id} acknowledged"
+    )
+
+    return {
+        "success": True,
+        "message": f"Alarm {ack.alarm_id} acknowledged",
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/events")
+async def get_event_history(limit: int = 100, event_type: str = None):
+    """이벤트 로그 조회"""
+    events = alarm_manager.get_event_history(limit=limit, event_type=event_type)
+    return {
+        "success": True,
+        "data": events,
+        "count": len(events),
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/operations")
+async def get_operation_records(start_date: str = None, end_date: str = None):
+    """운전 이력 조회"""
+    records = alarm_manager.get_operation_records(start_date=start_date, end_date=end_date)
+    return {
+        "success": True,
+        "data": records,
+        "count": len(records),
         "timestamp": datetime.now().isoformat()
     }
 
@@ -260,22 +357,44 @@ async def broadcast_realtime_data():
 
     while True:
         try:
+            # 센서 및 장비 데이터 수집 (WebSocket 연결 여부와 무관하게 항상 실행)
+            sensors = await asyncio.to_thread(plc_client.get_sensor_data)
+            equipment = await asyncio.to_thread(plc_client.get_all_equipment_data)
+
+            # 데이터 유효성 검사
+            if sensors:
+                last_sensors = sensors
+            else:
+                sensors = last_sensors  # 이전 데이터 사용
+
+            if equipment and len(equipment) > 0:
+                last_equipment = equipment
+            else:
+                equipment = last_equipment  # 이전 데이터 사용
+
+            # 새 사이클 시작 시 suppressed 알람 정리
+            if sensors and sensors.get("_new_cycle"):
+                alarm_manager.clear_all_suppressed()
+
+            # 알람 체크 (센서 및 장비 기반) - 항상 실행
+            new_alarms = []
+            if sensors:
+                sensor_alarms = alarm_manager.check_sensor_alarms(sensors)
+                new_alarms.extend(sensor_alarms)
+
+            if equipment:
+                equipment_alarms = alarm_manager.check_equipment_alarms(equipment)
+                new_alarms.extend(equipment_alarms)
+
+            # 새 알람 로깅 (active_alarms에는 이미 추가됨)
+            for alarm in new_alarms:
+                logger.warning(f"🔔 새 알람 발생: {alarm.message}")
+
+            # 알람 요약 정보
+            alarm_summary = alarm_manager.get_alarm_summary()
+
+            # WebSocket 클라이언트에 데이터 전송 (연결이 있을 때만)
             if active_connections:
-                # 센서 및 장비 데이터 수집
-                sensors = await asyncio.to_thread(plc_client.get_sensor_data)
-                equipment = await asyncio.to_thread(plc_client.get_all_equipment_data)
-
-                # 데이터 유효성 검사
-                if sensors:
-                    last_sensors = sensors
-                else:
-                    sensors = last_sensors  # 이전 데이터 사용
-
-                if equipment and len(equipment) > 0:
-                    last_equipment = equipment
-                else:
-                    equipment = last_equipment  # 이전 데이터 사용
-
                 # 하위 호환성을 위해 pumps도 함께 전송
                 pumps = equipment[:6] if equipment else []
 
@@ -284,6 +403,8 @@ async def broadcast_realtime_data():
                     "sensors": sensors,
                     "equipment": equipment,
                     "pumps": pumps,  # 하위 호환용
+                    "alarms": alarm_manager.get_active_alarms(),  # 활성 알람 목록
+                    "alarm_summary": alarm_summary,  # 알람 요약
                     "timestamp": datetime.now().isoformat()
                 }
 

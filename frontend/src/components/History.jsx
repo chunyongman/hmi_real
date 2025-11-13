@@ -1,23 +1,102 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import './History.css'
 
 function History() {
   const [activeTab, setActiveTab] = useState('alarms')
+  const [alarmHistory, setAlarmHistory] = useState([])
+  const [eventHistory, setEventHistory] = useState([])
+  const [operationHistory, setOperationHistory] = useState([])
+  const [loading, setLoading] = useState(false)
 
-  // 데모 데이터
-  const alarmHistory = [
-    { id: 1, time: '2025-10-18 14:30:15', level: 'warning', message: 'NO.1 SWP VFD Communication error', acknowledged: true },
-    { id: 2, time: '2025-10-18 12:15:23', level: 'critical', message: 'PLC FAULT', acknowledged: true },
-    { id: 3, time: '2025-10-18 10:45:10', level: 'info', message: 'System Start', acknowledged: true },
-    { id: 4, time: '2025-10-17 18:20:05', level: 'warning', message: 'CSW PP DISC TEMP SENSOR FAULT', acknowledged: true },
-  ]
+  // 데이터 로드
+  useEffect(() => {
+    if (activeTab === 'alarms') {
+      fetchAlarmHistory()
+    } else if (activeTab === 'events') {
+      fetchEventHistory()
+    } else if (activeTab === 'operation') {
+      fetchOperationHistory()
+    }
+  }, [activeTab])
 
-  const eventHistory = [
-    { id: 1, time: '2025-10-18 14:35:20', type: 'control', user: 'Admin', message: 'SWP1 시작 명령' },
-    { id: 2, time: '2025-10-18 14:30:15', type: 'alarm', user: 'System', message: 'VFD 통신 오류 발생' },
-    { id: 3, time: '2025-10-18 13:45:30', type: 'setting', user: 'Admin', message: '온도 설정값 변경: 30°C → 32°C' },
-    { id: 4, time: '2025-10-18 12:00:00', type: 'system', user: 'System', message: '자동 리포트 생성' },
-  ]
+  const fetchAlarmHistory = async () => {
+    setLoading(true)
+    try {
+      const response = await fetch('http://localhost:8000/api/alarms/history?limit=100')
+      const result = await response.json()
+      if (result.success) {
+        setAlarmHistory(result.data)
+      }
+    } catch (error) {
+      console.error('알람 이력 조회 오류:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const fetchEventHistory = async () => {
+    setLoading(true)
+    try {
+      const response = await fetch('http://localhost:8000/api/events?limit=100')
+      const result = await response.json()
+      if (result.success) {
+        setEventHistory(result.data)
+      }
+    } catch (error) {
+      console.error('이벤트 로그 조회 오류:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const fetchOperationHistory = async () => {
+    setLoading(true)
+    try {
+      const response = await fetch('http://localhost:8000/api/operations')
+      const result = await response.json()
+      if (result.success) {
+        setOperationHistory(result.data)
+      }
+    } catch (error) {
+      console.error('운전 이력 조회 오류:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // CSV 내보내기 함수
+  const exportToCSV = (data, filename) => {
+    if (!data || data.length === 0) {
+      alert('내보낼 데이터가 없습니다.')
+      return
+    }
+
+    // CSV 헤더 및 데이터 생성
+    const headers = Object.keys(data[0])
+    const csvContent = [
+      headers.join(','),
+      ...data.map(row => headers.map(header => {
+        const value = row[header]
+        // 쉼표가 포함된 값은 따옴표로 감싸기
+        return typeof value === 'string' && value.includes(',')
+          ? `"${value}"`
+          : value
+      }).join(','))
+    ].join('\n')
+
+    // BOM 추가 (한글 깨짐 방지)
+    const BOM = '\uFEFF'
+    const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' })
+    const link = document.createElement('a')
+    const url = URL.createObjectURL(blob)
+
+    link.setAttribute('href', url)
+    link.setAttribute('download', `${filename}_${new Date().toISOString().slice(0,10)}.csv`)
+    link.style.visibility = 'hidden'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  }
 
   return (
     <div className="history">
@@ -48,16 +127,17 @@ function History() {
       </div>
 
       <div className="history-content">
-        {activeTab === 'alarms' && <AlarmHistory data={alarmHistory} />}
-        {activeTab === 'events' && <EventHistory data={eventHistory} />}
-        {activeTab === 'operation' && <OperationHistory />}
+        {loading && <div className="loading">데이터 로딩 중...</div>}
+        {!loading && activeTab === 'alarms' && <AlarmHistory data={alarmHistory} onExport={exportToCSV} />}
+        {!loading && activeTab === 'events' && <EventHistory data={eventHistory} onExport={exportToCSV} />}
+        {!loading && activeTab === 'operation' && <OperationHistory data={operationHistory} onExport={exportToCSV} />}
       </div>
     </div>
   )
 }
 
 // 알람 이력
-function AlarmHistory({ data }) {
+function AlarmHistory({ data, onExport }) {
   const [filter, setFilter] = useState('all')
   const [searchTerm, setSearchTerm] = useState('')
 
@@ -80,14 +160,16 @@ function AlarmHistory({ data }) {
           </select>
         </div>
         <div className="search-group">
-          <input 
-            type="text" 
+          <input
+            type="text"
             placeholder="🔍 알람 검색..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
           />
         </div>
-        <button className="btn-export">📥 CSV 내보내기</button>
+        <button className="btn-export" onClick={() => onExport(filtered, 'alarm_history')}>
+          📥 CSV 내보내기
+        </button>
       </div>
 
       <div className="history-table">
@@ -146,7 +228,7 @@ function AlarmHistory({ data }) {
 }
 
 // 이벤트 로그
-function EventHistory({ data }) {
+function EventHistory({ data, onExport }) {
   const [filter, setFilter] = useState('all')
 
   const filtered = data.filter(event => {
@@ -177,7 +259,9 @@ function EventHistory({ data }) {
             <option value="system">시스템</option>
           </select>
         </div>
-        <button className="btn-export">📥 CSV 내보내기</button>
+        <button className="btn-export" onClick={() => onExport(filtered, 'event_history')}>
+          📥 CSV 내보내기
+        </button>
       </div>
 
       <div className="event-list">
@@ -199,24 +283,20 @@ function EventHistory({ data }) {
 }
 
 // 운전 이력
-function OperationHistory() {
-  const operationData = [
-    { pump: 'SWP1', date: '2025-10-18', runtime: 18.5, energy: 125, saved: 45 },
-    { pump: 'SWP2', date: '2025-10-18', runtime: 5.5, energy: 38, saved: 12 },
-    { pump: 'FWP1', date: '2025-10-18', runtime: 22.0, energy: 156, saved: 58 },
-  ]
-
+function OperationHistory({ data, onExport }) {
   return (
     <div className="operation-history">
       <div className="history-controls">
         <div className="date-range">
           <label>조회 기간:</label>
-          <input type="date" defaultValue="2025-10-18" />
+          <input type="date" defaultValue={new Date().toISOString().slice(0, 10)} />
           <span>~</span>
-          <input type="date" defaultValue="2025-10-18" />
+          <input type="date" defaultValue={new Date().toISOString().slice(0, 10)} />
         </div>
         <button className="btn-search">🔍 조회</button>
-        <button className="btn-export">📥 리포트 생성</button>
+        <button className="btn-export" onClick={() => onExport(data, 'operation_history')}>
+          📥 리포트 생성
+        </button>
       </div>
 
       <div className="operation-table">
@@ -232,26 +312,41 @@ function OperationHistory() {
             </tr>
           </thead>
           <tbody>
-            {operationData.map((row, idx) => (
-              <tr key={idx}>
-                <td><strong>{row.pump}</strong></td>
-                <td>{row.date}</td>
-                <td>{row.runtime} h</td>
-                <td>{row.energy} kWh</td>
-                <td className="highlight">{row.saved} kWh</td>
-                <td className="highlight">{((row.saved / row.energy) * 100).toFixed(1)}%</td>
+            {data && data.length > 0 ? (
+              data.map((row, idx) => (
+                <tr key={idx}>
+                  <td><strong>{row.equipment_name}</strong></td>
+                  <td>{row.date}</td>
+                  <td>{row.runtime_hours?.toFixed(1)} h</td>
+                  <td>{row.energy_kwh?.toFixed(1)} kWh</td>
+                  <td className="highlight">{row.saved_kwh?.toFixed(1)} kWh</td>
+                  <td className="highlight">
+                    {row.energy_kwh > 0 ? ((row.saved_kwh / row.energy_kwh) * 100).toFixed(1) : 0}%
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan="6" style={{textAlign: 'center', padding: '20px'}}>
+                  운전 이력 데이터가 없습니다.
+                </td>
               </tr>
-            ))}
+            )}
           </tbody>
-          <tfoot>
-            <tr className="total-row">
-              <td colSpan="2"><strong>합계</strong></td>
-              <td><strong>{operationData.reduce((sum, r) => sum + r.runtime, 0)} h</strong></td>
-              <td><strong>{operationData.reduce((sum, r) => sum + r.energy, 0)} kWh</strong></td>
-              <td className="highlight"><strong>{operationData.reduce((sum, r) => sum + r.saved, 0)} kWh</strong></td>
-              <td className="highlight"><strong>36.1%</strong></td>
-            </tr>
-          </tfoot>
+          {data && data.length > 0 && (
+            <tfoot>
+              <tr className="total-row">
+                <td colSpan="2"><strong>합계</strong></td>
+                <td><strong>{data.reduce((sum, r) => sum + (r.runtime_hours || 0), 0).toFixed(1)} h</strong></td>
+                <td><strong>{data.reduce((sum, r) => sum + (r.energy_kwh || 0), 0).toFixed(1)} kWh</strong></td>
+                <td className="highlight"><strong>{data.reduce((sum, r) => sum + (r.saved_kwh || 0), 0).toFixed(1)} kWh</strong></td>
+                <td className="highlight"><strong>
+                  {(data.reduce((sum, r) => sum + (r.saved_kwh || 0), 0) /
+                    data.reduce((sum, r) => sum + (r.energy_kwh || 0), 0) * 100).toFixed(1)}%
+                </strong></td>
+              </tr>
+            </tfoot>
+          )}
         </table>
       </div>
 

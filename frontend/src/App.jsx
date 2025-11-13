@@ -16,6 +16,8 @@ function App() {
   const [pumps, setPumps] = useState([])
   const [fans, setFans] = useState([])
   const [equipment, setEquipment] = useState([])
+  const [alarms, setAlarms] = useState([])
+  const [alarmSummary, setAlarmSummary] = useState({})
   const [connected, setConnected] = useState(false)
   const [ws, setWs] = useState(null)
   const [activeTab, setActiveTab] = useState('dashboard')
@@ -51,6 +53,8 @@ function App() {
           setEquipment(data.equipment || [])
           setPumps(data.pumps || data.equipment?.slice(0, 6) || [])
           setFans(data.equipment?.slice(6, 10) || [])
+          setAlarms(data.alarms || [])
+          setAlarmSummary(data.alarm_summary || {})
         }
       } catch (error) {
         console.error('WebSocket 메시지 파싱 오류:', error)
@@ -190,7 +194,7 @@ function App() {
           📋 이력
         </button>
         <button
-          className={activeTab === 'alarm' ? 'active' : ''}
+          className={`${activeTab === 'alarm' ? 'active' : ''} ${alarms.some(a => !a.acknowledged) ? 'has-unack-alarms' : ''}`}
           onClick={() => setActiveTab('alarm')}
         >
           🔔 알람
@@ -252,7 +256,7 @@ function App() {
           <History />
         )}
         {activeTab === 'alarm' && (
-          <AlarmPanel />
+          <AlarmPanel alarms={alarms} alarmSummary={alarmSummary} />
         )}
       </main>
 
