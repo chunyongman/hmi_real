@@ -38,7 +38,12 @@
       "Bash(cmd /c \"taskkill /F /PID 28424 && taskkill /F /PID 13396 && taskkill /F /PID 25100 && taskkill /F /PID 24640 && taskkill /F /PID 22224 && taskkill /F /PID 7808 && taskkill /F /PID 17948\")",
       "Bash(cmd /c \"for /f \"\"tokens=5\"\" %a in (''netstat -ano ^| findstr :8000 ^| findstr LISTENING'') do taskkill /F /PID %a\")",
       "Bash(timeout:*)",
-      "Bash(wmic:*)"
+      "Bash(wmic:*)",
+      "Bash(cmd /c \"for /f \"tokens=5\" %a in (''netstat -ano ^| findstr :8000 ^| findstr LISTENING'') do taskkill /F /PID %a\")",
+      "Bash(cmd /c \"taskkill /F /PID 14236 && taskkill /F /PID 13912 && taskkill /F /PID 27968\")",
+      "Bash(cat:*)",
+      "Bash(cmd /c \"for /f \"\"tokens=5\"\" %a in (''netstat -ano ^| findstr :5173 ^| findstr LISTENING'') do taskkill /F /PID %a\")",
+      "Bash(cmd /c \"taskkill /F /IM python.exe\")"
     ],
     "deny": [],
     "ask": []

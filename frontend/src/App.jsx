@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import Dashboard from './components/Dashboard'
 import CoolingDiagramImage from './components/CoolingDiagramImage'
 import DynamicSVGDiagram from './components/DynamicSVGDiagram'
@@ -12,6 +12,7 @@ import History from './components/History'
 import './App.css'
 
 function App() {
+  // State 관리
   const [sensors, setSensors] = useState({})
   const [pumps, setPumps] = useState([])
   const [fans, setFans] = useState([])
@@ -21,6 +22,56 @@ function App() {
   const [connected, setConnected] = useState(false)
   const [ws, setWs] = useState(null)
   const [activeTab, setActiveTab] = useState('dashboard')
+
+  // 경고음 관련 상태
+  const [audioContext, setAudioContext] = useState(null)
+  const [alarmSoundMuted, setAlarmSoundMuted] = useState(false) // Mute 상태
+  const prevAlarmIdsRef = useRef(new Set())
+  const isFirstRenderRef = useRef(true)
+  const alarmSoundIntervalRef = useRef(null) // 연속 경고음 인터벌
+  const alarmsRef = useRef([]) // 최신 alarms 상태를 참조하기 위한 ref
+
+  // AudioContext 초기화
+  useEffect(() => {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)()
+    console.log('🎵 [App] AudioContext 생성됨, 초기 상태:', ctx.state)
+
+    // 즉시 AudioContext를 활성화 시도
+    const initAudio = async () => {
+      try {
+        await ctx.resume()
+        console.log('🔊 [App] AudioContext 즉시 활성화 시도:', ctx.state)
+      } catch (error) {
+        console.log('⚠️ [App] AudioContext 즉시 활성화 실패, 사용자 인터랙션 필요')
+      }
+    }
+    initAudio()
+    setAudioContext(ctx)
+
+    // 사용자 인터랙션으로 AudioContext 활성화
+    const resumeAudio = async () => {
+      console.log('👆 [App] 사용자 인터랙션 감지, AudioContext 상태:', ctx.state)
+      if (ctx.state === 'suspended') {
+        await ctx.resume()
+        console.log('🔊 [App] AudioContext 활성화됨')
+
+        // AudioContext 활성화 후 미확인 알람이 있으면 경고음 시작
+        if (alarms.some(a => !a.acknowledged) && !alarmSoundIntervalRef.current) {
+          console.log('🔔 [App] AudioContext 활성화 후 경고음 시작')
+          startContinuousAlarmSound()
+        }
+      }
+    }
+
+    document.addEventListener('click', resumeAudio, { once: true })
+    document.addEventListener('keydown', resumeAudio, { once: true })
+
+    return () => {
+      document.removeEventListener('click', resumeAudio)
+      document.removeEventListener('keydown', resumeAudio)
+      if (ctx) ctx.close()
+    }
+  }, [])
 
   useEffect(() => {
     // WebSocket 연결
@@ -33,10 +84,151 @@ function App() {
     }
   }, [])
 
+  // 경고음 재생 함수 (한 번의 비프음 패턴)
+  const playAlarmSoundOnce = async () => {
+    if (!audioContext || alarmSoundMuted) {
+      return
+    }
+
+    try {
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume()
+      }
+
+      // alarmsRef에서 최신 알람 목록 가져오기
+      const currentAlarms = alarmsRef.current
+      const unacknowledgedAlarms = currentAlarms.filter(a => !a.acknowledged)
+      const hasCritical = unacknowledgedAlarms.some(a => a.level === 'critical')
+      const hasWarning = unacknowledgedAlarms.some(a => a.level === 'warning')
+
+      // Critical: 연속 3번, Warning: 2번, Info: 1번
+      let beepCount = 1
+      if (hasCritical) {
+        beepCount = 3
+      } else if (hasWarning) {
+        beepCount = 2
+      }
+
+      console.log(`🔊 [App] 경고음 재생: ${beepCount}번 (Critical: ${hasCritical}, Warning: ${hasWarning}, 총 미확인: ${unacknowledgedAlarms.length})`)
+
+      // 비프음 재생
+      for (let i = 0; i < beepCount; i++) {
+        setTimeout(() => {
+          const oscillator = audioContext.createOscillator()
+          const gainNode = audioContext.createGain()
+
+          oscillator.connect(gainNode)
+          gainNode.connect(audioContext.destination)
+
+          oscillator.frequency.value = 880
+          oscillator.type = 'sine'
+
+          gainNode.gain.setValueAtTime(0.3, audioContext.currentTime)
+          gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.15)
+
+          oscillator.start(audioContext.currentTime)
+          oscillator.stop(audioContext.currentTime + 0.15)
+        }, i * 200)
+      }
+    } catch (error) {
+      console.error('❌ [App] 경고음 재생 오류:', error)
+    }
+  }
+
+  // 연속 경고음 시작
+  const startContinuousAlarmSound = () => {
+    console.log('🔊 [App] 연속 경고음 시작')
+
+    // 기존 인터벌 정리
+    if (alarmSoundIntervalRef.current) {
+      clearInterval(alarmSoundIntervalRef.current)
+    }
+
+    // 즉시 한 번 재생
+    playAlarmSoundOnce()
+
+    // 2초마다 반복 재생
+    alarmSoundIntervalRef.current = setInterval(() => {
+      playAlarmSoundOnce()
+    }, 2000)
+  }
+
+  // 연속 경고음 정지
+  const stopContinuousAlarmSound = () => {
+    console.log('🔇 [App] 연속 경고음 정지')
+    if (alarmSoundIntervalRef.current) {
+      clearInterval(alarmSoundIntervalRef.current)
+      alarmSoundIntervalRef.current = null
+    }
+  }
+
+  // Mute 토글 함수
+  const toggleAlarmMute = () => {
+    setAlarmSoundMuted(!alarmSoundMuted)
+    if (!alarmSoundMuted) {
+      // Mute 활성화 시 경고음 정지
+      stopContinuousAlarmSound()
+    } else {
+      // Mute 해제 시 미확인 알람이 있으면 경고음 재시작
+      const hasUnacknowledged = alarms.some(a => !a.acknowledged)
+      if (hasUnacknowledged) {
+        startContinuousAlarmSound()
+      }
+    }
+  }
+
+  // alarms 상태가 변경될 때마다 alarmsRef 업데이트
+  useEffect(() => {
+    alarmsRef.current = alarms
+  }, [alarms])
+
+  // 알람 감지 및 연속 경고음 관리
+  useEffect(() => {
+    const hasUnacknowledged = alarms.some(a => !a.acknowledged)
+
+    // 상세 디버그 로그
+    console.log('🔍 [App] 알람 상태 체크:', {
+      총알람: alarms.length,
+      미확인알람: hasUnacknowledged,
+      muted: alarmSoundMuted,
+      audioContext: !!audioContext,
+      intervalActive: !!alarmSoundIntervalRef.current
+    })
+
+    // 알람 상세 정보 출력
+    console.log('📋 [App] 알람 목록:', alarms.map(a => ({
+      id: a.id,
+      tag: a.tag,
+      message: a.message,
+      acknowledged: a.acknowledged
+    })))
+
+    if (hasUnacknowledged && audioContext && !alarmSoundMuted) {
+      // 미확인 알람이 있는데 경고음이 울리지 않고 있으면 시작
+      if (!alarmSoundIntervalRef.current) {
+        console.log('🔊 [App] 미확인 알람 감지 - 연속 경고음 시작')
+        startContinuousAlarmSound()
+      }
+    } else {
+      // 미확인 알람이 없으면 경고음 정지
+      if (alarmSoundIntervalRef.current) {
+        console.log('✅ [App] 모든 알람 확인됨 - 경고음 정지')
+        stopContinuousAlarmSound()
+      }
+    }
+
+    // Cleanup: 컴포넌트 언마운트 시 경고음 정지
+    return () => {
+      if (alarmSoundIntervalRef.current) {
+        stopContinuousAlarmSound()
+      }
+    }
+  }, [alarms, audioContext, alarmSoundMuted])
+
   const connectWebSocket = () => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${protocol}//${window.location.hostname}:8000/ws`
-    
+
     console.log('WebSocket 연결 시도:', wsUrl)
     const websocket = new WebSocket(wsUrl)
 
@@ -256,7 +448,12 @@ function App() {
           <History />
         )}
         {activeTab === 'alarm' && (
-          <AlarmPanel alarms={alarms} alarmSummary={alarmSummary} />
+          <AlarmPanel
+            alarms={alarms}
+            alarmSummary={alarmSummary}
+            alarmSoundMuted={alarmSoundMuted}
+            onToggleMute={toggleAlarmMute}
+          />
         )}
       </main>
 

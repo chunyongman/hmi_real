@@ -6,11 +6,14 @@
 """
 
 import json
+import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class AlarmLevel(str, Enum):
@@ -85,11 +88,12 @@ class AlarmManager:
         self.operation_file = self.data_dir / "operations.json"
 
         # 메모리 캐시
-        self.active_alarms: Dict[str, Alarm] = {}  # tag를 키로 사용
+        self.active_alarms: Dict[str, Alarm] = {}  # ID를 키로 사용 (무제한 누적 가능)
         self.alarm_history: List[Alarm] = []
         self.event_history: List[Event] = []
         self.operation_records: Dict[str, OperationRecord] = {}
-        self.suppressed_alarms: Dict[str, Alarm] = {}  # 확인되었지만 조건이 계속되는 알람 (재발생 방지)
+        self.suppressed_alarms: Dict[str, Alarm] = {}  # 확인되었지만 조건이 계속되는 알람 (재발생 방지, tag 기반)
+        self.suppressed_tags: set = set()  # 확인된 알람의 태그 목록 (재발생 방지용)
 
         # 알람 설정 (임계값)
         self.alarm_config = self._load_alarm_config()
@@ -111,8 +115,8 @@ class AlarmManager:
             "T3_HIGH": {"level": AlarmLevel.CRITICAL, "threshold": 75, "message": "청수 쿨러 출구 온도 상승 (FW Cooler SW Out High)"},
             "T4_HIGH": {"level": AlarmLevel.WARNING, "threshold": 50, "message": "청수 쿨러 입구 온도 상승 (FW Cooler FW In High)"},
             "T5_HIGH": {"level": AlarmLevel.CRITICAL, "threshold": 40, "message": "청수 쿨러 출구 온도 상승 (FW Cooler FW Out High)"},
-            "T6_HIGH": {"level": AlarmLevel.CRITICAL, "threshold": 50, "message": "기관실 내부 온도 상승 (E/R Inside Temp High)"},
-            "T7_HIGH": {"level": AlarmLevel.WARNING, "threshold": 40, "message": "기관실 외부 온도 상승 (Outside Air Temp High)"},
+            "T6_HIGH": {"level": AlarmLevel.WARNING, "threshold": 50, "message": "기관실 내부 온도 상승 (E/R Inside Temp High)"},
+            "T7_HIGH": {"level": AlarmLevel.CRITICAL, "threshold": 40, "message": "기관실 외부 온도 상승 (Outside Air Temp High)"},
 
             # 압력 알람 (bar, Pa)
             "PX1_LOW": {"level": AlarmLevel.WARNING, "threshold": 1.5, "message": "냉각수 압력 저하 (CSW Pressure Low)"},
@@ -120,7 +124,7 @@ class AlarmManager:
             "PX2_HIGH": {"level": AlarmLevel.WARNING, "threshold": 150, "message": "기관실 차압 이상 (E/R Diff Press High)"},
 
             # 부하 알람 (%)
-            "PU1_HIGH": {"level": AlarmLevel.WARNING, "threshold": 85, "message": "주기관 부하 과다 (M/E Load High)"},
+            "PU1_HIGH": {"level": AlarmLevel.CRITICAL, "threshold": 85, "message": "주기관 부하 과다 (M/E Load High)"},
 
             # 장비 알람
             "EQUIPMENT_FAULT": {"level": AlarmLevel.CRITICAL, "message": "Equipment Fault"},
@@ -158,10 +162,17 @@ class AlarmManager:
                 alarm_tag = f"{tag}_HIGH"
 
                 if value > config["threshold"]:
-                    # 알람 조건 - 새 알람 추가 (단, suppressed 상태가 아닐 때만)
-                    if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                    # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                    has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+
+                    logger.debug(f"🔍 [AlarmManager] 알람 체크 {alarm_tag}: has_active={has_active_alarm}, suppressed={alarm_tag in self.suppressed_tags}")
+                    logger.debug(f"   현재 활성 알람: {[a.tag for a in self.active_alarms.values()]}")
+                    logger.debug(f"   억제된 태그: {self.suppressed_tags}")
+
+                    if not has_active_alarm and alarm_tag not in self.suppressed_tags:
+                        alarm_id = self._generate_alarm_id()
                         alarm = Alarm(
-                            id=self._generate_alarm_id(),
+                            id=alarm_id,
                             level=config["level"],
                             message=f"{config['message']}: {value:.1f}°C",
                             time=current_time,
@@ -169,8 +180,15 @@ class AlarmManager:
                             value=value
                         )
                         new_alarms.append(alarm)
-                        self.active_alarms[alarm_tag] = alarm
-                # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
+                        self.active_alarms[alarm_id] = alarm  # ID를 키로 사용하여 무제한 누적
+                        logger.info(f"✅ [AlarmManager] 새 알람 생성: {alarm_id} ({alarm_tag})")
+                else:
+                    # 정상 조건 - 해당 태그의 활성 알람 자동 해제
+                    alarms_to_remove = [aid for aid, alarm in self.active_alarms.items() if alarm.tag == alarm_tag]
+                    for aid in alarms_to_remove:
+                        alarm = self.active_alarms.pop(aid)
+                        self.alarm_history.append(alarm)
+                        logger.info(f"✅ [AlarmManager] 알람 자동 해제 (조건 정상 복귀): {alarm.message}")
 
             # Low 체크 (T1만)
             if tag == "T1":
@@ -180,10 +198,12 @@ class AlarmManager:
                     alarm_tag = f"{tag}_LOW"
 
                     if value < config["threshold"]:
-                        # 알람 조건 - 새 알람 추가
-                        if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                        # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                        has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+                        if not has_active_alarm and alarm_tag not in self.suppressed_tags:
+                            alarm_id = self._generate_alarm_id()
                             alarm = Alarm(
-                                id=self._generate_alarm_id(),
+                                id=alarm_id,
                                 level=config["level"],
                                 message=f"{config['message']}: {value:.1f}°C",
                                 time=current_time,
@@ -191,8 +211,14 @@ class AlarmManager:
                                 value=value
                             )
                             new_alarms.append(alarm)
-                            self.active_alarms[alarm_tag] = alarm
-                    # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
+                            self.active_alarms[alarm_id] = alarm
+                    else:
+                        # 정상 조건 - 해당 태그의 활성 알람 자동 해제
+                        alarms_to_remove = [aid for aid, alarm in self.active_alarms.items() if alarm.tag == alarm_tag]
+                        for aid in alarms_to_remove:
+                            alarm = self.active_alarms.pop(aid)
+                            self.alarm_history.append(alarm)
+                            logger.info(f"✅ [AlarmManager] 알람 자동 해제 (조건 정상 복귀): {alarm.message}")
 
         # 압력 체크 (센서 키는 DPX1, DPX2)
         px1 = sensors.get("DPX1")  # CSW PP Disc Press (kg/cm² 또는 bar)
@@ -200,11 +226,13 @@ class AlarmManager:
             # Low 체크
             alarm_tag = "PX1_LOW"
             if px1 < self.alarm_config["PX1_LOW"]["threshold"]:
-                # 알람 조건 - 새 알람 추가
-                if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+                if not has_active_alarm and alarm_tag not in self.suppressed_tags:
                     config = self.alarm_config["PX1_LOW"]
+                    alarm_id = self._generate_alarm_id()
                     alarm = Alarm(
-                        id=self._generate_alarm_id(),
+                        id=alarm_id,
                         level=config["level"],
                         message=f"{config['message']}: {px1:.2f} bar",
                         time=current_time,
@@ -212,17 +240,25 @@ class AlarmManager:
                         value=px1
                     )
                     new_alarms.append(alarm)
-                    self.active_alarms[alarm_tag] = alarm
-            # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
+                    self.active_alarms[alarm_id] = alarm
+            else:
+                # 정상 조건 - 해당 태그의 활성 알람 자동 해제
+                alarms_to_remove = [aid for aid, alarm in self.active_alarms.items() if alarm.tag == alarm_tag]
+                for aid in alarms_to_remove:
+                    alarm = self.active_alarms.pop(aid)
+                    self.alarm_history.append(alarm)
+                    logger.info(f"✅ [AlarmManager] 알람 자동 해제 (조건 정상 복귀): {alarm.message}")
 
             # High 체크
             alarm_tag = "PX1_HIGH"
             if px1 > self.alarm_config["PX1_HIGH"]["threshold"]:
-                # 알람 조건 - 새 알람 추가
-                if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+                if not has_active_alarm and alarm_tag not in self.suppressed_tags:
                     config = self.alarm_config["PX1_HIGH"]
+                    alarm_id = self._generate_alarm_id()
                     alarm = Alarm(
-                        id=self._generate_alarm_id(),
+                        id=alarm_id,
                         level=config["level"],
                         message=f"{config['message']}: {px1:.2f} bar",
                         time=current_time,
@@ -230,19 +266,27 @@ class AlarmManager:
                         value=px1
                     )
                     new_alarms.append(alarm)
-                    self.active_alarms[alarm_tag] = alarm
-            # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
+                    self.active_alarms[alarm_id] = alarm
+            else:
+                # 정상 조건 - 해당 태그의 활성 알람 자동 해제
+                alarms_to_remove = [aid for aid, alarm in self.active_alarms.items() if alarm.tag == alarm_tag]
+                for aid in alarms_to_remove:
+                    alarm = self.active_alarms.pop(aid)
+                    self.alarm_history.append(alarm)
+                    logger.info(f"✅ [AlarmManager] 알람 자동 해제 (조건 정상 복귀): {alarm.message}")
 
         # E/R 차압 체크 (DPX2)
         px2 = sensors.get("DPX2")  # E/R Diff Press (Pa)
         if px2 is not None:
             alarm_tag = "PX2_HIGH"
             if px2 > self.alarm_config["PX2_HIGH"]["threshold"]:
-                # 알람 조건 - 새 알람 추가
-                if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+                if not has_active_alarm and alarm_tag not in self.suppressed_tags:
                     config = self.alarm_config["PX2_HIGH"]
+                    alarm_id = self._generate_alarm_id()
                     alarm = Alarm(
-                        id=self._generate_alarm_id(),
+                        id=alarm_id,
                         level=config["level"],
                         message=f"{config['message']}: {px2:.1f} Pa",
                         time=current_time,
@@ -250,19 +294,32 @@ class AlarmManager:
                         value=px2
                     )
                     new_alarms.append(alarm)
-                    self.active_alarms[alarm_tag] = alarm
-            # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
+                    self.active_alarms[alarm_id] = alarm
+            else:
+                # 정상 조건 - 해당 태그의 활성 알람 자동 해제
+                alarms_to_remove = [aid for aid, alarm in self.active_alarms.items() if alarm.tag == alarm_tag]
+                for aid in alarms_to_remove:
+                    alarm = self.active_alarms.pop(aid)
+                    self.alarm_history.append(alarm)
+                    logger.info(f"✅ [AlarmManager] 알람 자동 해제 (조건 정상 복귀): {alarm.message}")
 
         # 기관 부하 체크 (PU1)
         pu1 = sensors.get("PU1")  # M/E Load (%)
         if pu1 is not None:
             alarm_tag = "PU1_HIGH"
             if pu1 > self.alarm_config["PU1_HIGH"]["threshold"]:
-                # 알람 조건 - 새 알람 추가
-                if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+
+                logger.debug(f"🔍 [AlarmManager] 알람 체크 {alarm_tag}: has_active={has_active_alarm}, suppressed={alarm_tag in self.suppressed_tags}")
+                logger.debug(f"   현재 활성 알람: {[a.tag for a in self.active_alarms.values()]}")
+                logger.debug(f"   억제된 태그: {self.suppressed_tags}")
+
+                if not has_active_alarm and alarm_tag not in self.suppressed_tags:
                     config = self.alarm_config["PU1_HIGH"]
+                    alarm_id = self._generate_alarm_id()
                     alarm = Alarm(
-                        id=self._generate_alarm_id(),
+                        id=alarm_id,
                         level=config["level"],
                         message=f"{config['message']}: {pu1:.1f}%",
                         time=current_time,
@@ -270,8 +327,15 @@ class AlarmManager:
                         value=pu1
                     )
                     new_alarms.append(alarm)
-                    self.active_alarms[alarm_tag] = alarm
-            # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
+                    self.active_alarms[alarm_id] = alarm
+                    logger.info(f"✅ [AlarmManager] 새 알람 생성: {alarm_id} ({alarm_tag})")
+            else:
+                # 정상 조건 - 해당 태그의 활성 알람 자동 해제
+                alarms_to_remove = [aid for aid, alarm in self.active_alarms.items() if alarm.tag == alarm_tag]
+                for aid in alarms_to_remove:
+                    alarm = self.active_alarms.pop(aid)
+                    self.alarm_history.append(alarm)
+                    logger.info(f"✅ [AlarmManager] 알람 자동 해제 (조건 정상 복귀): {alarm.message}")
 
         return new_alarms
 
@@ -288,49 +352,55 @@ class AlarmManager:
             # 장비 고장 체크
             alarm_tag = f"{name}_FAULT"
             if status == "fault":
-                # 알람 조건 - 새 알람 추가
-                if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+                if not has_active_alarm and alarm_tag not in self.suppressed_tags:
+                    alarm_id = self._generate_alarm_id()
                     alarm = Alarm(
-                        id=self._generate_alarm_id(),
+                        id=alarm_id,
                         level=AlarmLevel.CRITICAL,
                         message=f"{name} Equipment Fault",
                         time=current_time,
                         tag=alarm_tag
                     )
                     new_alarms.append(alarm)
-                    self.active_alarms[alarm_tag] = alarm
+                    self.active_alarms[alarm_id] = alarm
             # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
 
             # VFD 통신 오류
             alarm_tag = f"{name}_VFD_COMM"
             if not vfd_status.get("connected", True):
-                # 알람 조건 - 새 알람 추가
-                if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+                if not has_active_alarm and alarm_tag not in self.suppressed_tags:
+                    alarm_id = self._generate_alarm_id()
                     alarm = Alarm(
-                        id=self._generate_alarm_id(),
+                        id=alarm_id,
                         level=AlarmLevel.WARNING,
                         message=f"{name} VFD Communication Error",
                         time=current_time,
                         tag=alarm_tag
                     )
                     new_alarms.append(alarm)
-                    self.active_alarms[alarm_tag] = alarm
+                    self.active_alarms[alarm_id] = alarm
             # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
 
             # VFD 과부하
             alarm_tag = f"{name}_VFD_OVERLOAD"
             if vfd_status.get("overload", False):
-                # 알람 조건 - 새 알람 추가
-                if alarm_tag not in self.active_alarms and alarm_tag not in self.suppressed_alarms:
+                # 알람 조건 - 같은 태그의 활성 알람이 없고, suppressed 상태가 아닐 때만 추가
+                has_active_alarm = any(alarm.tag == alarm_tag for alarm in self.active_alarms.values())
+                if not has_active_alarm and alarm_tag not in self.suppressed_tags:
+                    alarm_id = self._generate_alarm_id()
                     alarm = Alarm(
-                        id=self._generate_alarm_id(),
+                        id=alarm_id,
                         level=AlarmLevel.CRITICAL,
                         message=f"{name} VFD Overload",
                         time=current_time,
                         tag=alarm_tag
                     )
                     new_alarms.append(alarm)
-                    self.active_alarms[alarm_tag] = alarm
+                    self.active_alarms[alarm_id] = alarm
             # 정상 조건이어도 자동 해제하지 않음 (사용자가 확인할 때까지 유지)
 
         return new_alarms
@@ -355,46 +425,43 @@ class AlarmManager:
         # suppressed_alarms는 유지 (사용자가 확인한 알람은 조건이 정상화되어도 기록 유지)
 
     def clear_all_suppressed(self):
-        """모든 알람 정리 (새로운 알람 사이클 시작 시 호출)"""
+        """확인된 알람만 정리 (새로운 알람 사이클 시작 시 호출) - 재발생 방지 태그 초기화"""
         import logging
         logger = logging.getLogger(__name__)
 
-        # Active와 Suppressed 알람 개수 카운트
-        active_count = len(self.active_alarms)
+        # Suppressed 알람만 카운트 (확인된 알람)
         suppressed_count = len(self.suppressed_alarms)
-        total_count = active_count + suppressed_count
 
-        # Active 알람도 이력에 추가 (미확인 알람 기록)
-        for tag, alarm in self.active_alarms.items():
-            if not alarm.acknowledged:
-                self.alarm_history.append(alarm)
-
-        # 모두 정리
-        self.active_alarms.clear()
+        # Suppressed 알람만 정리 (Active 알람은 유지 - 미확인 알람 계속 표시)
         self.suppressed_alarms.clear()
+        self.suppressed_tags.clear()  # 새 사이클에서 같은 알람 재발생 허용
         self._save_data()
 
-        if total_count > 0:
-            logger.info(f"🧹 모든 알람 정리 완료 (Active: {active_count}개, Suppressed: {suppressed_count}개, 총 {total_count}개)")
+        if suppressed_count > 0:
+            logger.info(f"🧹 확인된 알람 정리 완료 (Suppressed: {suppressed_count}개)")
+            logger.info(f"📋 미확인 알람 유지 (Active: {len(self.active_alarms)}개)")
+            logger.info(f"🔄 재발생 방지 태그 초기화 완료")
 
     def acknowledge_alarm(self, alarm_id: str, user: str = "Operator") -> bool:
         """알람 확인 및 suppressed로 이동 (조건이 계속되면 재발생 방지)"""
-        # 활성 알람에서 찾기
-        for tag, alarm in list(self.active_alarms.items()):
+        # 활성 알람에서 찾기 (이제 ID가 키)
+        for aid, alarm in list(self.active_alarms.items()):
             if alarm.id == alarm_id:
                 alarm.acknowledged = True
                 alarm.ack_time = datetime.now().isoformat()
                 alarm.ack_user = user
 
                 # 확인된 알람은 active_alarms에서 제거하고 suppressed로 이동
-                self.active_alarms.pop(tag)
-                self.suppressed_alarms[tag] = alarm  # 재발생 방지를 위해 suppressed에 보관
+                self.active_alarms.pop(aid)
+                self.suppressed_alarms[alarm.tag] = alarm  # tag 기반으로 재발생 방지
+                self.suppressed_tags.add(alarm.tag)  # 재발생 방지 태그 추가
                 self.alarm_history.append(alarm)
                 self._save_data()
 
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.info(f"✅ 알람 확인 (suppressed): {alarm.message} (확인자: {user})")
+                logger.info(f"🔒 재발생 방지 태그 추가: {alarm.tag}")
                 return True
 
         # 이력에서 찾기

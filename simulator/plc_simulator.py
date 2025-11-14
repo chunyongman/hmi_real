@@ -127,15 +127,23 @@ class ESSPLCSimulator:
                     # 알람 조건 시작
                     self.alarm_active = True
                     self.alarm_scenario_counter = 0
-                    print("[시뮬레이터] 🔔 알람 시나리오 시작 (10초간 유지)")
-                    print("  - E/R 온도 상승 (TX6: 40°C → 52°C)")
-                    print("  - SW 압력 저하 (DPX1: 3.5 → 1.3 kg/cm²)")
+                    print("=" * 70)
+                    print("[시뮬레이터] 🔔 알람 시나리오 시작 (15초간 유지)")
+                    print("  - 🔴 주기관 부하 과다 (PU1: 60% → 90%, CRITICAL)")
+                    print("  - 🔴 외부 공기 온도 상승 (TX7: 25°C → 42°C, CRITICAL)")
+                    print("  - ⚠️ E/R 내부 온도 상승 (TX6: 40°C → 52°C, WARNING)")
+                    print("  - ⚠️ SW 압력 저하 (DPX1: 3.5 → 1.3 kg/cm², WARNING)")
+                    print("=" * 70)
 
-                if self.alarm_active and self.alarm_scenario_counter >= 10:
+                if self.alarm_active and self.alarm_scenario_counter >= 15:
                     # 알람 조건 해제
                     self.alarm_active = False
                     self.alarm_scenario_counter = 0
+                    print("=" * 70)
                     print("[시뮬레이터] ✅ 알람 시나리오 종료 (정상 복귀)")
+                    print("  알람은 165초 후 재발생")
+                    print("  (현재 알람은 확인 전까지 유지됨)")
+                    print("=" * 70)
 
                 # 온도 센서 (K400010~K400016)
                 tx1 = self.base_temps['TX1'] + random.uniform(-1.5, 1.5)
@@ -144,13 +152,17 @@ class ESSPLCSimulator:
                 tx4 = self.base_temps['TX4'] + random.uniform(-1.5, 1.5)
                 tx5 = self.base_temps['TX5'] + random.uniform(-1.0, 1.0)
 
-                # TX6 (E/R 온도) - 알람 시나리오 적용
+                # TX6 (E/R 내부 온도) - 알람 시나리오 적용
                 if self.alarm_active:
-                    tx6 = 52.0 + random.uniform(-0.5, 0.5)  # 알람 조건 (HIGH: 50°C 이상)
+                    tx6 = 52.0 + random.uniform(-0.5, 0.5)  # WARNING 알람 조건 (HIGH: 50°C 이상)
                 else:
                     tx6 = self.base_temps['TX6'] + random.uniform(-2.0, 2.0)
 
-                tx7 = self.base_temps['TX7'] + random.uniform(-0.5, 0.5)
+                # TX7 (E/R 외부 온도) - 알람 시나리오 적용
+                if self.alarm_active:
+                    tx7 = 42.0 + random.uniform(-0.5, 0.5)  # CRITICAL 알람 조건 (HIGH: 40°C 이상)
+                else:
+                    tx7 = self.base_temps['TX7'] + random.uniform(-0.5, 0.5)
 
                 # Holding Registers에 쓰기 (address 10~16)
                 self.store.setValues(3, 10, [
@@ -177,9 +189,12 @@ class ESSPLCSimulator:
                     self.pressure_pa_to_raw(dpx2)
                 ])
 
-                # M/E Load (K400019)
-                self.me_load += random.uniform(-1.0, 1.0)
-                self.me_load = max(20, min(100, self.me_load))
+                # M/E Load (K400019) - 알람 시나리오 적용
+                if self.alarm_active:
+                    self.me_load = 90.0 + random.uniform(-0.5, 0.5)  # CRITICAL 알람 조건 (HIGH: 85% 이상)
+                else:
+                    self.me_load += random.uniform(-1.0, 1.0)
+                    self.me_load = max(20, min(80, self.me_load))  # 정상 범위: 20~80%
                 self.store.setValues(3, 19, [self.percentage_to_raw(self.me_load)])
 
                 # 장비 상태 업데이트
